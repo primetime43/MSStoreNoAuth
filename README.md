@@ -36,3 +36,5 @@
 ### Argument mode
 
 Pass a Store URL or raw Store ID as the only argument
+
+![image](https://github.com/user-attachments/assets/f9222b20-fa76-49ec-8c80-362da89cb21e)
