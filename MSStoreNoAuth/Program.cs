@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 
 class Program
 {
+    private static string _version = "v1.0";
     // HRESULT → friendly message map
     static readonly Dictionary<uint, string> WingetErrors = new()
     {
@@ -17,6 +18,8 @@ class Program
 
     static async Task<int> Main(string[] args)
     {
+        Console.Title = $"MSStoreNoAuth by primetime43 {_version}";
+        Console.WriteLine($"MSStoreNoAuth by primetime43 {_version}. https://github.com/primetime43/MSStoreNoAuth \n");
         do
         {
             // 1) Get or prompt for input
