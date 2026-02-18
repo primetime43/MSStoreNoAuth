@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Security.Principal;
 using System.Threading.Tasks;
 
 class Program
@@ -14,12 +15,43 @@ class Program
         { 0x80073CF3, "Package not found in msstore source. Check the ID/URL." },
         { 0x80073D02, "Another install is in progress. Wait for it to finish." },
         { 0x80070057, "Invalid argument. Verify the Store ID or URL." },
+        { 0x80070422, "A required Windows service is disabled. Microsoft Store installs need several services running." },
     };
+
+    static bool IsAdmin()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    static void RelaunchAsAdmin(string[] args)
+    {
+        try
+        {
+            var exePath = Environment.ProcessPath ?? "MSStoreNoAuth.exe";
+            var psi = new ProcessStartInfo(exePath)
+            {
+                UseShellExecute = true,
+                Verb = "runas"
+            };
+            if (args.Length > 0)
+                psi.Arguments = string.Join(" ", args);
+
+            Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to relaunch as Administrator: {ex.Message}");
+            Console.WriteLine("Please right-click the .exe and select 'Run as administrator'.");
+        }
+    }
 
     static async Task<int> Main(string[] args)
     {
         Console.Title = $"MSStoreNoAuth by primetime43 {_version}";
-        Console.WriteLine($"MSStoreNoAuth by primetime43 {_version}. https://github.com/primetime43/MSStoreNoAuth \n");
+        Console.WriteLine($"MSStoreNoAuth by primetime43 {_version}. https://github.com/primetime43/MSStoreNoAuth");
+        Console.WriteLine(IsAdmin() ? "[Running as Administrator]\n" : "[Running as standard user]\n");
         do
         {
             // 1) Get or prompt for input
@@ -55,10 +87,46 @@ class Program
             if (mode && result.exitCode != 0)
             {
                 Console.WriteLine("\nAuto-accept failed; switching to manual mode…\n");
-                await RunWinget(storeId, autoAccept: false);
+                result = await RunWinget(storeId, autoAccept: false);
             }
 
-            // 5) Ask to repeat
+            // 5) If install failed with 0x80070422, offer to fix services or relaunch as admin
+            if (result.exitCode != 0 && unchecked((uint)result.exitCode) == 0x80070422)
+            {
+                if (!IsAdmin())
+                {
+                    Console.WriteLine("\nThis error usually requires Administrator privileges to resolve.");
+                    Console.Write("Would you like to relaunch this app as Administrator? (Y/N): ");
+                    var relaunch = Console.ReadLine()?.Trim().ToUpperInvariant();
+                    if (relaunch == "Y")
+                    {
+                        RelaunchAsAdmin(new[] { storeId });
+                        return 0;
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("\nMicrosoft Store installs require several Windows services to be running.");
+                    Console.Write("Would you like to enable them and retry? (Y/N): ");
+                    var fix = Console.ReadLine()?.Trim().ToUpperInvariant();
+                    if (fix == "Y")
+                    {
+                        if (await TryEnableStoreServices())
+                        {
+                            Console.WriteLine("\nRetrying install…\n");
+                            var retryResult = await RunWinget(storeId, mode);
+                            if (retryResult.exitCode != 0 && unchecked((uint)retryResult.exitCode) == 0x80070422)
+                            {
+                                Console.WriteLine("\nStill failing. Try resetting winget sources:");
+                                Console.WriteLine("  winget source reset --force");
+                                Console.WriteLine("Then restart this app and try again.");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6) Ask to repeat
             Console.Write("\nInstall another? (Y/N): ");
             var again = Console.ReadLine()?.Trim().ToUpperInvariant();
             if (again != "Y")
@@ -150,5 +218,87 @@ class Program
         }
 
         return (exitCode, stdOut, stdErr);
+    }
+
+    // Services required for Microsoft Store installs
+    static readonly string[] StoreServices =
+    {
+        "wuauserv", "BITS", "UsoSvc", "DoSvc",
+        "TokenBroker", "wlidsvc", "LicenseManager",
+        "InstallService", "ClipSVC", "AppXSvc"
+    };
+    static readonly Dictionary<string, string> ServiceNames = new()
+    {
+        { "wuauserv", "Windows Update" },
+        { "BITS", "Background Intelligent Transfer Service" },
+        { "UsoSvc", "Update Orchestrator Service" },
+        { "DoSvc", "Delivery Optimization" },
+        { "TokenBroker", "Web Account Manager" },
+        { "wlidsvc", "Microsoft Account Sign-in Assistant" },
+        { "LicenseManager", "Windows License Manager Service" },
+        { "InstallService", "Microsoft Store Install Service" },
+        { "ClipSVC", "Client License Service" },
+        { "AppXSvc", "AppX Deployment Service" },
+    };
+
+    static async Task<bool> TryEnableStoreServices()
+    {
+        Console.WriteLine("Enabling required services…\n");
+        var failedServices = new List<string>();
+
+        foreach (var svc in StoreServices)
+        {
+            var name = ServiceNames.GetValueOrDefault(svc, svc);
+
+            // Try to configure service to demand-start (may fail for trigger-start services — that's OK)
+            await RunProcess("sc", $"config {svc} start= demand");
+
+            // Try to start the service (exit code 2 = already running, which is fine)
+            var startResult = await RunProcess("net", $"start {svc}");
+            if (startResult == 0 || startResult == 2)
+                Console.WriteLine($"  [{svc}] {name} — OK");
+            else
+            {
+                Console.WriteLine($"  [{svc}] {name} — FAILED to start");
+                failedServices.Add(svc);
+            }
+        }
+
+        Console.WriteLine();
+
+        if (failedServices.Count > 0)
+        {
+            Console.WriteLine("Some services could not be started:");
+            foreach (var svc in failedServices)
+                Console.WriteLine($"  sc config {svc} start= demand && net start {svc}");
+            Console.WriteLine("\nTry running the above commands manually in an elevated PowerShell/Command Prompt.");
+            Console.WriteLine("You can also try: winget source reset --force");
+            return false;
+        }
+
+        Console.WriteLine("All required services are running.");
+        return true;
+    }
+
+    static async Task<int> RunProcess(string fileName, string arguments)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(fileName, arguments)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var proc = Process.Start(psi)
+                ?? throw new InvalidOperationException($"Failed to start {fileName}.");
+            await proc.WaitForExitAsync();
+            return proc.ExitCode;
+        }
+        catch
+        {
+            return -1;
+        }
     }
 }
