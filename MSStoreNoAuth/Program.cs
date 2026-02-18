@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 class Program
 {
-    private static string _version = "v1.0";
+    private static string _version = "v1.1";
     // HRESULT → friendly message map
     static readonly Dictionary<uint, string> WingetErrors = new()
     {
