@@ -81,4 +81,4 @@ git tag v1.2
 git push origin v1.2
 ```
 
-The GitHub Actions workflow builds a self-contained Windows x64 `.exe`, creates a SHA-256 checksum, and attaches both files to a GitHub Release with generated release notes. Numeric tags such as `1.2` are also supported.
+The GitHub Actions workflow builds a self-contained Windows x64 `.exe` and attaches it to a GitHub Release with generated release notes. Numeric tags such as `1.2` are also supported.

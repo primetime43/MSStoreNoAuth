@@ -44,7 +44,7 @@ jobs:
           -p:DebugType=None
           -p:DebugSymbols=false
 
-      - name: Verify executable and create checksum
+      - name: Verify executable
         shell: pwsh
         run: |
           $exe = 'artifacts/win-x64/MSStoreNoAuth.exe'
@@ -52,26 +52,20 @@ jobs:
             throw "Publish did not create $exe"
           }
 
-          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
-          "$hash  MSStoreNoAuth.exe" | Set-Content -Encoding ascii "$exe.sha256"
-
       - name: Create or update GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = '${{ github.ref_name }}'
-          $assets = @(
-            'artifacts/win-x64/MSStoreNoAuth.exe#MSStoreNoAuth.exe',
-            'artifacts/win-x64/MSStoreNoAuth.exe.sha256#SHA-256 checksum'
-          )
+          $asset = 'artifacts/win-x64/MSStoreNoAuth.exe#MSStoreNoAuth.exe'
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag @assets --clobber
+            gh release upload $tag $asset --clobber
           }
           else {
-            gh release create $tag @assets --verify-tag --generate-notes --title $tag
+            gh release create $tag $asset --verify-tag --generate-notes --title $tag
           }
 
           if ($LASTEXITCODE -ne 0) {
@@ -82,8 +76,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: MSStoreNoAuth-${{ github.ref_name }}-win-x64
-          path: |
-            artifacts/win-x64/MSStoreNoAuth.exe
-            artifacts/win-x64/MSStoreNoAuth.exe.sha256
+          path: artifacts/win-x64/MSStoreNoAuth.exe
           if-no-files-found: error
           retention-days: 30
