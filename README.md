@@ -16,6 +16,7 @@
 - **Live winget output** so longer Store installs do not appear stuck
 - **Already-installed detection** instead of reporting "no applicable update" as a failure
 - **Exact Store ID matching** to prevent ambiguous package selection
+- **Official Store Web Installer fallback** for apps missing from winget's catalog
 - **Loop support** so you can install multiple apps in one session
 
 ---
@@ -77,8 +78,8 @@ You'll then be asked to choose between auto-accept or manual mode for agreement 
 Commit the desired release contents, create a version tag on that commit, and push the tag:
 
 ```powershell
-git tag v1.2
-git push origin v1.2
+git tag v1.3
+git push origin v1.3
 ```
 
 The GitHub Actions workflow builds a self-contained Windows x64 `.exe` and attaches it to a GitHub Release with generated release notes. Numeric tags such as `1.2` are also supported.

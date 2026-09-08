@@ -1,10 +1,12 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text.RegularExpressions;
 
 internal static partial class Program
 {
-    private const string Version = "v1.2";
+    private const string Version = "v1.3";
+    private const uint WingetNoApplicationsFound = 0x8A150014;
     private const uint WingetUpdateNotApplicable = 0x8A15002B;
     private const uint WingetPackageAlreadyInstalled = 0x8A150061;
     private const uint WingetInstallerAlreadyInstalled = 0x8A15010D;
@@ -42,6 +44,8 @@ internal static partial class Program
         0x8A150042, // prompt input error
         0x8A150076, // interactive authentication required
     ];
+
+    private static readonly HttpClient HttpClient = CreateHttpClient();
 
     private static bool IsAdmin()
     {
@@ -112,11 +116,29 @@ internal static partial class Program
 
             var autoAccept = options.AutoAccept ?? (interactiveSession ? PromptForMode() : true);
             var result = await RunWinget(storeId, autoAccept);
+            var usedWebInstaller = false;
+            string? webInstallerError = null;
 
             if (autoAccept && !result.ReachedDesiredState && ManualRetryErrors.Contains(result.HResult))
             {
                 Console.WriteLine("\nwinget requires interaction; retrying in manual mode...\n");
                 result = await RunWinget(storeId, autoAccept: false);
+            }
+
+            if (result.HResult == WingetNoApplicationsFound)
+            {
+                Console.WriteLine("\nThis app is not exposed through winget's Microsoft Store catalog.");
+                Console.WriteLine("Trying Microsoft's official Store Web Installer...\n");
+                var webInstallerResult = await RunStoreWebInstaller(storeId);
+                if (webInstallerResult.Success)
+                {
+                    result = new(0);
+                    usedWebInstaller = true;
+                }
+                else
+                {
+                    webInstallerError = webInstallerResult.Error;
+                }
             }
 
             if (result.AlreadyInstalled)
@@ -125,11 +147,15 @@ internal static partial class Program
             }
             else if (result.ExitCode == 0)
             {
-                Console.WriteLine("Successfully installed.");
+                Console.WriteLine(usedWebInstaller
+                    ? "Successfully installed using Microsoft Store Web Installer."
+                    : "Successfully installed.");
             }
             else
             {
                 PrintWingetFailure(result);
+                if (!string.IsNullOrWhiteSpace(webInstallerError))
+                    Console.Error.WriteLine($"Store Web Installer error: {webInstallerError}");
                 finalExitCode = 1;
             }
 
@@ -319,6 +345,143 @@ internal static partial class Program
         }
     }
 
+    private static HttpClient CreateHttpClient()
+    {
+        var client = new HttpClient
+        {
+            Timeout = TimeSpan.FromMinutes(2),
+        };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd($"MSStoreNoAuth/{Version.TrimStart('v')}");
+        return client;
+    }
+
+    private static async Task<StoreInstallerResult> RunStoreWebInstaller(string storeId)
+    {
+        const int maximumInstallerSize = 20 * 1024 * 1024;
+        var installerUri = new Uri(
+            $"https://get.microsoft.com/installer/download/{Uri.EscapeDataString(storeId)}?cid=MSStoreNoAuth");
+        var installerPath = Path.Combine(
+            Path.GetTempPath(),
+            $"MSStoreNoAuth-{storeId}-{Guid.NewGuid():N}.exe");
+
+        try
+        {
+            using var response = await HttpClient.GetAsync(installerUri);
+            if (!response.IsSuccessStatusCode)
+                return new(false, $"Microsoft returned HTTP {(int)response.StatusCode} ({response.ReasonPhrase}).");
+
+            var installerBytes = await response.Content.ReadAsByteArrayAsync();
+            if (installerBytes.Length == 0)
+                return new(false, "Microsoft returned an empty installer.");
+            if (installerBytes.Length > maximumInstallerSize)
+                return new(false, "The downloaded Store installer was unexpectedly large.");
+
+            await File.WriteAllBytesAsync(installerPath, installerBytes);
+            if (!HasTrustedAuthenticodeSignature(installerPath))
+                return new(false, "The downloaded installer did not have a valid trusted signature.");
+
+            var versionInfo = FileVersionInfo.GetVersionInfo(installerPath);
+            if (!string.Equals(versionInfo.CompanyName, "Microsoft Corporation", StringComparison.OrdinalIgnoreCase))
+                return new(false, "The downloaded installer was not published by Microsoft Corporation.");
+
+            Console.WriteLine("Downloaded and verified Microsoft Store Installer. Starting installation...\n");
+            using var process = Process.Start(new ProcessStartInfo(installerPath)
+            {
+                UseShellExecute = true,
+            });
+            if (process is null)
+                return new(false, "Windows could not start the Store installer.");
+
+            await process.WaitForExitAsync();
+            return process.ExitCode == 0
+                ? new(true, null)
+                : new(false, $"The Store installer exited with code {process.ExitCode}.");
+        }
+        catch (Exception ex)
+        {
+            return new(false, ex.Message);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(installerPath))
+                    File.Delete(installerPath);
+            }
+            catch
+            {
+                // Windows may briefly retain the installer after it exits. The
+                // uniquely named file can safely remain in the temporary folder.
+            }
+        }
+    }
+
+    private static bool HasTrustedAuthenticodeSignature(string filePath)
+    {
+        var fileInfo = new WinTrustFileInfo
+        {
+            StructSize = (uint)Marshal.SizeOf<WinTrustFileInfo>(),
+            FilePath = filePath,
+        };
+        var fileInfoPointer = Marshal.AllocHGlobal(Marshal.SizeOf<WinTrustFileInfo>());
+
+        try
+        {
+            Marshal.StructureToPtr(fileInfo, fileInfoPointer, fDeleteOld: false);
+            var trustData = new WinTrustData
+            {
+                StructSize = (uint)Marshal.SizeOf<WinTrustData>(),
+                UiChoice = 2,       // WTD_UI_NONE
+                UnionChoice = 1,    // WTD_CHOICE_FILE
+                FileInfoPointer = fileInfoPointer,
+                StateAction = 0,    // WTD_STATEACTION_IGNORE
+            };
+            var action = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+            return WinVerifyTrust(new IntPtr(-1), ref action, ref trustData) == 0;
+        }
+        finally
+        {
+            Marshal.DestroyStructure<WinTrustFileInfo>(fileInfoPointer);
+            Marshal.FreeHGlobal(fileInfoPointer);
+        }
+    }
+
+    [DllImport("wintrust.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern uint WinVerifyTrust(
+        IntPtr windowHandle,
+        ref Guid actionId,
+        ref WinTrustData trustData);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WinTrustFileInfo
+    {
+        public uint StructSize;
+
+        [MarshalAs(UnmanagedType.LPWStr)]
+        public string FilePath;
+
+        public IntPtr FileHandle;
+        public IntPtr KnownSubject;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WinTrustData
+    {
+        public uint StructSize;
+        public IntPtr PolicyCallbackData;
+        public IntPtr SipClientData;
+        public uint UiChoice;
+        public uint RevocationChecks;
+        public uint UnionChoice;
+        public IntPtr FileInfoPointer;
+        public uint StateAction;
+        public IntPtr StateData;
+        public IntPtr UrlReference;
+        public uint ProviderFlags;
+        public uint UiContext;
+        public IntPtr SignatureSettings;
+    }
+
     private static void PrintWingetFailure(WingetResult result)
     {
         Console.Error.WriteLine($"winget exited {result.ExitCode} (0x{result.HResult:X8})");
@@ -445,4 +608,6 @@ internal static partial class Program
             or WingetInstallerAlreadyInstalled;
         public bool ReachedDesiredState => ExitCode == 0 || AlreadyInstalled;
     }
+
+    private readonly record struct StoreInstallerResult(bool Success, string? Error);
 }
