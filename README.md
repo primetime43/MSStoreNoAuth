@@ -72,4 +72,13 @@ You'll then be asked to choose between auto-accept or manual mode for agreement 
 
 ---
 
-The workflow builds a self-contained single-file `.exe` and attaches it to a GitHub Release with auto-generated release notes.
+## Creating a release
+
+Commit the desired release contents, create a version tag on that commit, and push the tag:
+
+```powershell
+git tag v1.2
+git push origin v1.2
+```
+
+The GitHub Actions workflow builds a self-contained Windows x64 `.exe`, creates a SHA-256 checksum, and attaches both files to a GitHub Release with generated release notes. Numeric tags such as `1.2` are also supported.

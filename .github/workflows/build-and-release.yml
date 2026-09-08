@@ -9,24 +9,80 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  release:
+    name: Publish Windows x64 executable
     runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Check out tagged source
+        uses: actions/checkout@v7
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
 
-      - name: Publish
-        run: dotnet publish MSStoreNoAuth/MSStoreNoAuth.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o publish
+      - name: Restore
+        run: dotnet restore MSStoreNoAuth/MSStoreNoAuth.csproj
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - name: Build self-contained executable
+        run: >-
+          dotnet publish MSStoreNoAuth/MSStoreNoAuth.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          --no-restore
+          --output artifacts/win-x64
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+
+      - name: Verify executable and create checksum
+        shell: pwsh
+        run: |
+          $exe = 'artifacts/win-x64/MSStoreNoAuth.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Publish did not create $exe"
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
+          "$hash  MSStoreNoAuth.exe" | Set-Content -Encoding ascii "$exe.sha256"
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $assets = @(
+            'artifacts/win-x64/MSStoreNoAuth.exe#MSStoreNoAuth.exe',
+            'artifacts/win-x64/MSStoreNoAuth.exe.sha256#SHA-256 checksum'
+          )
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists; leaving it unchanged."
+            exit 0
+          }
+
+          gh release create $tag @assets --verify-tag --generate-notes --title $tag
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to publish GitHub Release $tag"
+          }
+
+      - name: Save workflow artifact
+        uses: actions/upload-artifact@v7
         with:
-          files: publish/MSStoreNoAuth.exe
-          generate_release_notes: true
+          name: MSStoreNoAuth-${{ github.ref_name }}-win-x64
+          path: |
+            artifacts/win-x64/MSStoreNoAuth.exe
+            artifacts/win-x64/MSStoreNoAuth.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
