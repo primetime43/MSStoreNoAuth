@@ -12,7 +12,10 @@
 - **Argument mode** (pass URL or ID on the command-line)
 - **Auto-accept** or **manual** agreement confirmation
 - **Error-code mapping** for friendlier messages
-- **Automatic fallback** to manual mode if auto-accept fails
+- **Targeted fallback** to manual mode when winget specifically requires interaction
+- **Live winget output** so longer Store installs do not appear stuck
+- **Already-installed detection** instead of reporting "no applicable update" as a failure
+- **Exact Store ID matching** to prevent ambiguous package selection
 - **Loop support** so you can install multiple apps in one session
 
 ---
@@ -37,7 +40,7 @@
 
 ### Argument mode
 
-Pass a Store URL or raw Store ID as the only argument:
+Pass a Store URL or raw Store ID. Argument mode defaults to auto-accept and exits when the install finishes:
 
 ```
 MSStoreNoAuth.exe https://apps.microsoft.com/detail/xp89dcgq3k6vld
@@ -47,6 +50,12 @@ or
 
 ```
 MSStoreNoAuth.exe xp89dcgq3k6vld
+```
+
+Choose manual mode explicitly if you want to answer winget's package prompts:
+
+```
+MSStoreNoAuth.exe --manual https://apps.microsoft.com/detail/9pl7plm5bft2
 ```
 
 ### Interactive mode

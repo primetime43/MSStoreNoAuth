@@ -1,233 +1,367 @@
-﻿using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Security.Principal;
-using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 
-class Program
+internal static partial class Program
 {
-    private static string _version = "v1.1";
-    // HRESULT → friendly message map
-    static readonly Dictionary<uint, string> WingetErrors = new()
+    private const string Version = "v1.2";
+    private const uint WingetUpdateNotApplicable = 0x8A15002B;
+    private const uint WingetPackageAlreadyInstalled = 0x8A150061;
+    private const uint WingetInstallerAlreadyInstalled = 0x8A15010D;
+
+    private static readonly Dictionary<uint, string> WingetErrors = new()
     {
         { 0x80070005, "Access denied. Try running as Administrator." },
         { 0x800704C7, "Operation canceled. The install may have been aborted." },
-        { 0x80073CF3, "Package not found in msstore source. Check the ID/URL." },
+        { 0x80073CF3, "The package failed dependency, conflict, or validation checks." },
         { 0x80073D02, "Another install is in progress. Wait for it to finish." },
         { 0x80070057, "Invalid argument. Verify the Store ID or URL." },
-        { 0x80070422, "A required Windows service is disabled. Microsoft Store installs need several services running." },
+        { 0x80070422, "A required Windows service is disabled." },
+        { 0x8A150010, "This package is not compatible with this system." },
+        { 0x8A150014, "No package with this ID was found in the Microsoft Store source." },
+        { 0x8A15001B, "The Microsoft Store is blocked by system policy." },
+        { 0x8A15001C, "This Microsoft Store app is blocked by system policy." },
+        { 0x8A15001E, "The Microsoft Store installation failed. See the winget output above." },
+        { 0x8A150041, "The package agreements were not accepted." },
+        { 0x8A150045, "The Microsoft Store source could not be opened." },
+        { 0x8A150046, "The Microsoft Store source agreements were not accepted." },
+        { 0x8A150056, "This installer cannot run from an Administrator session." },
+        { 0x8A15006D, "A required service is busy or unavailable. Try again later." },
+        { 0x8A150076, "This package requires interactive authentication." },
+        { 0x8A15007D, "This user-scoped package cannot be changed from an Administrator session." },
+        { 0x8A15007F, "winget could not read the Microsoft Store catalog." },
+        { 0x8A150080, "No compatible Microsoft Store package is available for this system." },
+        { 0x8A150083, "The Microsoft Store license could not be retrieved." },
+        { 0x8A150085, "The current account is not permitted to retrieve this Store license." },
+        { 0x8A150107, "The app requires a working network connection." },
     };
 
-    static bool IsAdmin()
+    private static readonly HashSet<uint> ManualRetryErrors =
+    [
+        0x8A150041, // package agreements not accepted
+        0x8A150042, // prompt input error
+        0x8A150076, // interactive authentication required
+    ];
+
+    private static bool IsAdmin()
     {
         using var identity = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(identity);
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    static void RelaunchAsAdmin(string[] args)
+    private static void RelaunchAsAdmin(IEnumerable<string> arguments)
     {
         try
         {
             var exePath = Environment.ProcessPath ?? "MSStoreNoAuth.exe";
-            var psi = new ProcessStartInfo(exePath)
+            var startInfo = new ProcessStartInfo(exePath)
             {
                 UseShellExecute = true,
-                Verb = "runas"
+                Verb = "runas",
             };
-            if (args.Length > 0)
-                psi.Arguments = string.Join(" ", args);
 
-            Process.Start(psi);
+            foreach (var argument in arguments)
+                startInfo.ArgumentList.Add(argument);
+
+            Process.Start(startInfo);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Failed to relaunch as Administrator: {ex.Message}");
-            Console.WriteLine("Please right-click the .exe and select 'Run as administrator'.");
+            Console.WriteLine("Please right-click the executable and select 'Run as administrator'.");
         }
     }
 
-    static async Task<int> Main(string[] args)
+    private static async Task<int> Main(string[] args)
     {
-        Console.Title = $"MSStoreNoAuth by primetime43 {_version}";
-        Console.WriteLine($"MSStoreNoAuth by primetime43 {_version}. https://github.com/primetime43/MSStoreNoAuth");
+        var options = ParseOptions(args);
+        if (options.ShowHelp)
+        {
+            PrintHelp();
+            return 0;
+        }
+
+        if (options.Error is not null)
+        {
+            Console.Error.WriteLine($"Error: {options.Error}\n");
+            PrintHelp();
+            return 2;
+        }
+
+        var interactiveSession = args.Length == 0;
+        Console.Title = $"MSStoreNoAuth by primetime43 {Version}";
+        Console.WriteLine($"MSStoreNoAuth by primetime43 {Version}. https://github.com/primetime43/MSStoreNoAuth");
         Console.WriteLine(IsAdmin() ? "[Running as Administrator]\n" : "[Running as standard user]\n");
+
+        var finalExitCode = 0;
         do
         {
-            // 1) Get or prompt for input
-            string input = (args.Length == 1)
-                ? args[0].Trim()
-                : Prompt("Paste the Microsoft Store URL or just the Store ID:");
+            var input = interactiveSession
+                ? Prompt("Paste the Microsoft Store URL or just the Store ID:")
+                : options.Input!;
 
-            if (string.IsNullOrWhiteSpace(input))
-            {
-                Console.WriteLine("No input provided. Exiting.");
-                return 1;
-            }
-
-            // 2) Extract Store ID
             var storeId = ParseStoreId(input);
-            if (string.IsNullOrWhiteSpace(storeId))
+            if (storeId is null)
             {
-                Console.WriteLine("Couldn’t parse a valid Store ID. Exiting.");
-                return 1;
+                Console.Error.WriteLine("Could not parse a valid Microsoft Store ID.");
+                return 2;
             }
 
             Console.WriteLine($"\nTarget app ID: {storeId}\n");
 
-            // 3) Choose auto vs manual
-            Console.WriteLine("Select install mode:");
-            Console.WriteLine("  0) Auto-accept agreements");
-            Console.WriteLine("  1) Manual (you’ll confirm in winget)");
-            Console.Write("Choice [0]: ");
-            var mode = Console.ReadLine()?.Trim() == "1" ? false : true;
+            var autoAccept = options.AutoAccept ?? (interactiveSession ? PromptForMode() : true);
+            var result = await RunWinget(storeId, autoAccept);
 
-            // 4) Try install (and fallback if auto fails)
-            var result = await RunWinget(storeId, mode);
-            if (mode && result.exitCode != 0)
+            if (autoAccept && !result.ReachedDesiredState && ManualRetryErrors.Contains(result.HResult))
             {
-                Console.WriteLine("\nAuto-accept failed; switching to manual mode…\n");
+                Console.WriteLine("\nwinget requires interaction; retrying in manual mode...\n");
                 result = await RunWinget(storeId, autoAccept: false);
             }
 
-            // 5) If install failed with 0x80070422, offer to fix services or relaunch as admin
-            if (result.exitCode != 0 && unchecked((uint)result.exitCode) == 0x80070422)
+            if (result.AlreadyInstalled)
             {
-                if (!IsAdmin())
+                Console.WriteLine("Already installed; no newer applicable version is available.");
+            }
+            else if (result.ExitCode == 0)
+            {
+                Console.WriteLine("Successfully installed.");
+            }
+            else
+            {
+                PrintWingetFailure(result);
+                finalExitCode = 1;
+            }
+
+            if (!result.ReachedDesiredState && result.HResult == 0x80070422)
+            {
+                var serviceResult = await HandleDisabledServices(storeId, autoAccept);
+                if (serviceResult is not null)
                 {
-                    Console.WriteLine("\nThis error usually requires Administrator privileges to resolve.");
-                    Console.Write("Would you like to relaunch this app as Administrator? (Y/N): ");
-                    var relaunch = Console.ReadLine()?.Trim().ToUpperInvariant();
-                    if (relaunch == "Y")
+                    result = serviceResult.Value;
+                    if (result.ReachedDesiredState)
                     {
-                        RelaunchAsAdmin(new[] { storeId });
-                        return 0;
+                        Console.WriteLine(result.AlreadyInstalled
+                            ? "Already installed; no newer applicable version is available."
+                            : "Successfully installed.");
+                        finalExitCode = 0;
                     }
-                }
-                else
-                {
-                    Console.WriteLine("\nMicrosoft Store installs require several Windows services to be running.");
-                    Console.Write("Would you like to enable them and retry? (Y/N): ");
-                    var fix = Console.ReadLine()?.Trim().ToUpperInvariant();
-                    if (fix == "Y")
+                    else
                     {
-                        if (await TryEnableStoreServices())
-                        {
-                            Console.WriteLine("\nRetrying install…\n");
-                            var retryResult = await RunWinget(storeId, mode);
-                            if (retryResult.exitCode != 0 && unchecked((uint)retryResult.exitCode) == 0x80070422)
-                            {
-                                Console.WriteLine("\nStill failing. Try resetting winget sources:");
-                                Console.WriteLine("  winget source reset --force");
-                                Console.WriteLine("Then restart this app and try again.");
-                            }
-                        }
+                        PrintWingetFailure(result);
+                        finalExitCode = 1;
                     }
                 }
             }
 
-            // 6) Ask to repeat
+            if (!interactiveSession)
+                break;
+
             Console.Write("\nInstall another? (Y/N): ");
-            var again = Console.ReadLine()?.Trim().ToUpperInvariant();
-            if (again != "Y")
+            if (!string.Equals(Console.ReadLine()?.Trim(), "Y", StringComparison.OrdinalIgnoreCase))
                 break;
 
             Console.Clear();
-            // clear args so we always prompt next iteration
-            args = Array.Empty<string>();
-
+            finalExitCode = 0;
         } while (true);
 
-        return 0;
+        return finalExitCode;
     }
 
-    static string Prompt(string message)
+    private static CliOptions ParseOptions(string[] args)
+    {
+        if (args.Length == 0)
+            return new(null, null, false, null);
+
+        string? input = null;
+        bool? autoAccept = null;
+
+        foreach (var argument in args)
+        {
+            switch (argument.ToLowerInvariant())
+            {
+                case "-h":
+                case "--help":
+                case "/?":
+                    return new(null, null, true, null);
+                case "--auto":
+                    if (autoAccept == false)
+                        return new(null, null, false, "--auto and --manual cannot be used together.");
+                    autoAccept = true;
+                    break;
+                case "--manual":
+                    if (autoAccept == true)
+                        return new(null, null, false, "--auto and --manual cannot be used together.");
+                    autoAccept = false;
+                    break;
+                default:
+                    if (argument.StartsWith('-'))
+                        return new(null, null, false, $"Unknown option: {argument}");
+                    if (input is not null)
+                        return new(null, null, false, "Provide only one Microsoft Store URL or ID.");
+                    input = argument;
+                    break;
+            }
+        }
+
+        return input is null
+            ? new(null, null, false, "A Microsoft Store URL or ID is required.")
+            : new(input, autoAccept, false, null);
+    }
+
+    private static void PrintHelp()
+    {
+        Console.WriteLine("MSStoreNoAuth - install Microsoft Store apps without an interactive account sign-in\n");
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  MSStoreNoAuth.exe");
+        Console.WriteLine("  MSStoreNoAuth.exe [--auto|--manual] <Store URL or ID>\n");
+        Console.WriteLine("Options:");
+        Console.WriteLine("  --auto      Accept package agreements and disable winget prompts (default with an argument)");
+        Console.WriteLine("  --manual    Let winget prompt for package agreements");
+        Console.WriteLine("  -h, --help  Show this help");
+    }
+
+    private static bool PromptForMode()
+    {
+        Console.WriteLine("Select install mode:");
+        Console.WriteLine("  0) Auto-accept agreements");
+        Console.WriteLine("  1) Manual (you'll confirm in winget)");
+        Console.Write("Choice [0]: ");
+        return Console.ReadLine()?.Trim() != "1";
+    }
+
+    private static string Prompt(string message)
     {
         Console.WriteLine(message);
-        Console.Write("→ ");
-        return Console.ReadLine()?.Trim() ?? "";
+        Console.Write("-> ");
+        return Console.ReadLine()?.Trim() ?? string.Empty;
     }
 
-    static string ParseStoreId(string input)
+    internal static string? ParseStoreId(string input)
     {
-        if (Uri.TryCreate(input, UriKind.Absolute, out var uri))
+        input = input.Trim().Trim('"');
+        if (input.Length == 0)
+            return null;
+
+        if (!Uri.TryCreate(input, UriKind.Absolute, out var uri))
+            return StoreIdRegex().IsMatch(input) ? input.ToUpperInvariant() : null;
+
+        var supportedHost = uri.Host.Equals("apps.microsoft.com", StringComparison.OrdinalIgnoreCase)
+            || uri.Host.Equals("www.microsoft.com", StringComparison.OrdinalIgnoreCase)
+            || uri.Host.Equals("microsoft.com", StringComparison.OrdinalIgnoreCase);
+        if (!supportedHost)
+            return null;
+
+        foreach (var segment in uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries).Reverse())
         {
-            var segs = uri.AbsolutePath.TrimEnd('/').Split('/');
-            var last = segs[^1];
-            var q = last.IndexOf('?');
-            return q >= 0 ? last[..q] : last;
+            var candidate = Uri.UnescapeDataString(segment);
+            if (StoreIdRegex().IsMatch(candidate))
+                return candidate.ToUpperInvariant();
         }
-        return input;
+
+        return null;
     }
 
-    static async Task<(int exitCode, string stdOut, string stdErr)> RunWinget(string id, bool autoAccept)
+    private static async Task<WingetResult> RunWinget(string id, bool autoAccept)
     {
         Console.WriteLine(autoAccept
-            ? $"[Auto-accept] Installing {id}…\n"
-            : $"[Manual] Installing {id}…\n");
+            ? $"[Auto] Installing {id}...\n"
+            : $"[Manual] Installing {id}...\n");
 
-        var args = autoAccept
-            ? $"install {id} -s msstore --accept-source-agreements --accept-package-agreements"
-            : $"install {id} -s msstore";
-
-        var psi = new ProcessStartInfo("winget", args)
+        var startInfo = new ProcessStartInfo("winget")
         {
             UseShellExecute = false,
             CreateNoWindow = false,
+            // Manual mode must inherit the console so prompts that do not end in a
+            // newline remain visible and can read directly from the user's input.
             RedirectStandardOutput = autoAccept,
-            RedirectStandardError = autoAccept
+            RedirectStandardError = autoAccept,
         };
 
-        int exitCode;
-        string stdOut = "", stdErr = "";
+        foreach (var argument in new[] { "install", "--id", id, "--exact", "--source", "msstore", "--accept-source-agreements" })
+            startInfo.ArgumentList.Add(argument);
+
+        if (autoAccept)
+        {
+            startInfo.ArgumentList.Add("--accept-package-agreements");
+            startInfo.ArgumentList.Add("--disable-interactivity");
+        }
 
         try
         {
-            using var proc = Process.Start(psi)
+            using var process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException("Failed to start winget.");
-            if (autoAccept)
+
+            if (!autoAccept)
             {
-                stdOut = await proc.StandardOutput.ReadToEndAsync();
-                stdErr = await proc.StandardError.ReadToEndAsync();
+                await process.WaitForExitAsync();
+                return new(process.ExitCode);
             }
-            await proc.WaitForExitAsync();
-            exitCode = proc.ExitCode;
+
+            var stdoutTask = PumpOutput(process.StandardOutput, Console.Out);
+            var stderrTask = PumpOutput(process.StandardError, Console.Error);
+
+            await process.WaitForExitAsync();
+            await Task.WhenAll(stdoutTask, stderrTask);
+            return new(process.ExitCode);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error launching winget: {ex.Message}");
-            return (1, "", ex.Message);
+            return new(1, ex.Message);
         }
-
-        if (autoAccept && !string.IsNullOrWhiteSpace(stdOut))
-            Console.WriteLine(stdOut);
-
-        if (exitCode != 0)
-        {
-            uint h = unchecked((uint)exitCode);
-            Console.WriteLine($"winget exited {exitCode} (0x{h:X8})");
-
-            if (WingetErrors.TryGetValue(h, out var friendly))
-                Console.WriteLine($"Error: {friendly}");
-            else if (!string.IsNullOrWhiteSpace(stdErr))
-                Console.WriteLine(stdErr);
-        }
-        else
-        {
-            Console.WriteLine("Successfully installed.");
-        }
-
-        return (exitCode, stdOut, stdErr);
     }
 
-    // Services required for Microsoft Store installs
-    static readonly string[] StoreServices =
+    private static async Task PumpOutput(StreamReader reader, TextWriter writer)
     {
-        "wuauserv", "BITS", "UsoSvc", "DoSvc",
-        "TokenBroker", "wlidsvc", "LicenseManager",
-        "InstallService", "ClipSVC", "AppXSvc"
-    };
-    static readonly Dictionary<string, string> ServiceNames = new()
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            await writer.WriteLineAsync(line);
+        }
+    }
+
+    private static void PrintWingetFailure(WingetResult result)
+    {
+        Console.Error.WriteLine($"winget exited {result.ExitCode} (0x{result.HResult:X8})");
+
+        if (WingetErrors.TryGetValue(result.HResult, out var friendly))
+            Console.Error.WriteLine($"Error: {friendly}");
+        else if (!string.IsNullOrWhiteSpace(result.LaunchError))
+            Console.Error.WriteLine($"Error launching winget: {result.LaunchError}");
+        else
+            Console.Error.WriteLine("winget did not provide more details. Run 'winget --info' to locate its diagnostic logs.");
+    }
+
+    private static async Task<WingetResult?> HandleDisabledServices(string storeId, bool autoAccept)
+    {
+        if (!IsAdmin())
+        {
+            Console.WriteLine("\nThis error usually requires Administrator privileges to resolve.");
+            Console.Write("Relaunch this app as Administrator? (Y/N): ");
+            if (string.Equals(Console.ReadLine()?.Trim(), "Y", StringComparison.OrdinalIgnoreCase))
+                RelaunchAsAdmin(new[] { autoAccept ? "--auto" : "--manual", storeId });
+
+            return null;
+        }
+
+        Console.WriteLine("\nMicrosoft Store installs require several Windows services to be running.");
+        Console.Write("Enable them and retry? (Y/N): ");
+        if (!string.Equals(Console.ReadLine()?.Trim(), "Y", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        if (!await TryEnableStoreServices())
+            return null;
+
+        Console.WriteLine("\nRetrying install...\n");
+        return await RunWinget(storeId, autoAccept);
+    }
+
+    private static readonly string[] StoreServices =
+    [
+        "wuauserv", "BITS", "UsoSvc", "DoSvc", "TokenBroker", "wlidsvc",
+        "LicenseManager", "InstallService", "ClipSVC", "AppXSvc",
+    ];
+
+    private static readonly Dictionary<string, string> ServiceNames = new()
     {
         { "wuauserv", "Windows Update" },
         { "BITS", "Background Intelligent Transfer Service" },
@@ -241,64 +375,74 @@ class Program
         { "AppXSvc", "AppX Deployment Service" },
     };
 
-    static async Task<bool> TryEnableStoreServices()
+    private static async Task<bool> TryEnableStoreServices()
     {
-        Console.WriteLine("Enabling required services…\n");
+        Console.WriteLine("Enabling required services...\n");
         var failedServices = new List<string>();
 
-        foreach (var svc in StoreServices)
+        foreach (var service in StoreServices)
         {
-            var name = ServiceNames.GetValueOrDefault(svc, svc);
+            var name = ServiceNames.GetValueOrDefault(service, service);
+            await RunProcess("sc", $"config {service} start= demand");
+            var startResult = await RunProcess("net", $"start {service}");
 
-            // Try to configure service to demand-start (may fail for trigger-start services — that's OK)
-            await RunProcess("sc", $"config {svc} start= demand");
-
-            // Try to start the service (exit code 2 = already running, which is fine)
-            var startResult = await RunProcess("net", $"start {svc}");
-            if (startResult == 0 || startResult == 2)
-                Console.WriteLine($"  [{svc}] {name} — OK");
+            if (startResult is 0 or 2)
+                Console.WriteLine($"  [{service}] {name} - OK");
             else
             {
-                Console.WriteLine($"  [{svc}] {name} — FAILED to start");
-                failedServices.Add(svc);
+                Console.WriteLine($"  [{service}] {name} - FAILED to start");
+                failedServices.Add(service);
             }
         }
 
         Console.WriteLine();
-
-        if (failedServices.Count > 0)
+        if (failedServices.Count == 0)
         {
-            Console.WriteLine("Some services could not be started:");
-            foreach (var svc in failedServices)
-                Console.WriteLine($"  sc config {svc} start= demand && net start {svc}");
-            Console.WriteLine("\nTry running the above commands manually in an elevated PowerShell/Command Prompt.");
-            Console.WriteLine("You can also try: winget source reset --force");
-            return false;
+            Console.WriteLine("All required services are running.");
+            return true;
         }
 
-        Console.WriteLine("All required services are running.");
-        return true;
+        Console.WriteLine("Some services could not be started:");
+        foreach (var service in failedServices)
+            Console.WriteLine($"  sc config {service} start= demand && net start {service}");
+        Console.WriteLine("\nRun those commands manually in an elevated terminal, or reset the source with:");
+        Console.WriteLine("  winget source reset --force");
+        return false;
     }
 
-    static async Task<int> RunProcess(string fileName, string arguments)
+    private static async Task<int> RunProcess(string fileName, string arguments)
     {
         try
         {
-            var psi = new ProcessStartInfo(fileName, arguments)
+            var startInfo = new ProcessStartInfo(fileName, arguments)
             {
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardOutput = true,
-                RedirectStandardError = true
+                RedirectStandardError = true,
             };
-            using var proc = Process.Start(psi)
+            using var process = Process.Start(startInfo)
                 ?? throw new InvalidOperationException($"Failed to start {fileName}.");
-            await proc.WaitForExitAsync();
-            return proc.ExitCode;
+            await process.WaitForExitAsync();
+            return process.ExitCode;
         }
         catch
         {
             return -1;
         }
+    }
+
+    [GeneratedRegex("^[A-Za-z0-9]{8,20}$", RegexOptions.CultureInvariant)]
+    private static partial Regex StoreIdRegex();
+
+    private readonly record struct CliOptions(string? Input, bool? AutoAccept, bool ShowHelp, string? Error);
+
+    private readonly record struct WingetResult(int ExitCode, string? LaunchError = null)
+    {
+        public uint HResult => unchecked((uint)ExitCode);
+        public bool AlreadyInstalled => HResult is WingetUpdateNotApplicable
+            or WingetPackageAlreadyInstalled
+            or WingetInstallerAlreadyInstalled;
+        public bool ReachedDesiredState => ExitCode == 0 || AlreadyInstalled;
     }
 }
