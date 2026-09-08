@@ -55,7 +55,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 -Path $exe).Hash.ToLowerInvariant()
           "$hash  MSStoreNoAuth.exe" | Set-Content -Encoding ascii "$exe.sha256"
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,11 +68,12 @@ jobs:
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release $tag already exists; leaving it unchanged."
-            exit 0
+            gh release upload $tag @assets --clobber
+          }
+          else {
+            gh release create $tag @assets --verify-tag --generate-notes --title $tag
           }
 
-          gh release create $tag @assets --verify-tag --generate-notes --title $tag
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to publish GitHub Release $tag"
           }
