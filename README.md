@@ -1,6 +1,6 @@
 # MSStoreNoAuth
 
-> Install Microsoft Store apps without signing in to a Microsoft account
+> Install supported Microsoft Store apps without an interactive Microsoft account sign-in
 
 ---
 
@@ -16,7 +16,7 @@
 - **Live winget output** so longer Store installs do not appear stuck
 - **Already-installed detection** instead of reporting "no applicable update" as a failure
 - **Exact Store ID matching** to prevent ambiguous package selection
-- **Official Store Web Installer fallback** for apps missing from winget's catalog
+- **Official Store Web Installer fallback** for apps missing from winget's catalog or failing with `0x800704CF`
 - **Loop support** so you can install multiple apps in one session
 
 ---
@@ -71,7 +71,21 @@ You'll then be asked to choose between auto-accept or manual mode for agreement 
 
 ![image](https://github.com/user-attachments/assets/f9222b20-fa76-49ec-8c80-362da89cb21e)
 
+### Store install error `0x800704CF`
+
+This is Windows' `ERROR_NETWORK_UNREACHABLE`. When winget returns it, MSStoreNoAuth tries Microsoft's official Store Web Installer for the same app. The fallback depends on installer availability, network access, and any Store account requirements for the app.
+
+If both attempts fail, run `winget --info` to find the diagnostic logs and check that Microsoft Store and Windows Update endpoints are reachable through any proxy or firewall. See [Microsoft's Store download troubleshooting guide](https://learn.microsoft.com/troubleshoot/windows-client/shell-experience/troubleshooting-microsoft-store-apps-download-failure).
+
 ---
+
+## Running regression tests
+
+The regression tests run on Windows with the .NET 10 SDK. They simulate WinGet and Store Web Installer outcomes without installing apps or making network requests.
+
+```powershell
+dotnet run --project tests/MSStoreNoAuth.RegressionTests --configuration Release
+```
 
 ## Creating a release
 

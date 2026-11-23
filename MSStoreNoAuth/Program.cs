@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 internal static partial class Program
 {
     private const string Version = "v1.3";
+    private const uint NetworkUnreachable = 0x800704CF;
     private const uint WingetNoApplicationsFound = 0x8A150014;
     private const uint WingetUpdateNotApplicable = 0x8A15002B;
     private const uint WingetPackageAlreadyInstalled = 0x8A150061;
@@ -15,6 +16,7 @@ internal static partial class Program
     {
         { 0x80070005, "Access denied. Try running as Administrator." },
         { 0x800704C7, "Operation canceled. The install may have been aborted." },
+        { NetworkUnreachable, "Windows reported an unreachable network location during the Store install." },
         { 0x80073CF3, "The package failed dependency, conflict, or validation checks." },
         { 0x80073D02, "Another install is in progress. Wait for it to finish." },
         { 0x80070057, "Invalid argument. Verify the Store ID or URL." },
@@ -77,7 +79,12 @@ internal static partial class Program
         }
     }
 
-    private static async Task<int> Main(string[] args)
+    private static Task<int> Main(string[] args) => RunAsync(args, RunWinget, RunStoreWebInstaller);
+
+    internal static async Task<int> RunAsync(
+        string[] args,
+        Func<string, bool, Task<WingetResult>> runWinget,
+        Func<string, Task<StoreInstallerResult>> runStoreWebInstaller)
     {
         var options = ParseOptions(args);
         if (options.ShowHelp)
@@ -115,21 +122,23 @@ internal static partial class Program
             Console.WriteLine($"\nTarget app ID: {storeId}\n");
 
             var autoAccept = options.AutoAccept ?? (interactiveSession ? PromptForMode() : true);
-            var result = await RunWinget(storeId, autoAccept);
+            var result = await runWinget(storeId, autoAccept);
             var usedWebInstaller = false;
             string? webInstallerError = null;
 
             if (autoAccept && !result.ReachedDesiredState && ManualRetryErrors.Contains(result.HResult))
             {
                 Console.WriteLine("\nwinget requires interaction; retrying in manual mode...\n");
-                result = await RunWinget(storeId, autoAccept: false);
+                result = await runWinget(storeId, false);
             }
 
-            if (result.HResult == WingetNoApplicationsFound)
+            if (result.HResult is WingetNoApplicationsFound or NetworkUnreachable)
             {
-                Console.WriteLine("\nThis app is not exposed through winget's Microsoft Store catalog.");
+                Console.WriteLine(result.HResult == NetworkUnreachable
+                    ? "\nwinget reported a Store network error (0x800704CF)."
+                    : "\nThis app is not exposed through winget's Microsoft Store catalog.");
                 Console.WriteLine("Trying Microsoft's official Store Web Installer...\n");
-                var webInstallerResult = await RunStoreWebInstaller(storeId);
+                var webInstallerResult = await runStoreWebInstaller(storeId);
                 if (webInstallerResult.Success)
                 {
                     result = new(0);
@@ -161,7 +170,7 @@ internal static partial class Program
 
             if (!result.ReachedDesiredState && result.HResult == 0x80070422)
             {
-                var serviceResult = await HandleDisabledServices(storeId, autoAccept);
+                var serviceResult = await HandleDisabledServices(storeId, autoAccept, runWinget);
                 if (serviceResult is not null)
                 {
                     result = serviceResult.Value;
@@ -492,9 +501,16 @@ internal static partial class Program
             Console.Error.WriteLine($"Error launching winget: {result.LaunchError}");
         else
             Console.Error.WriteLine("winget did not provide more details. Run 'winget --info' to locate its diagnostic logs.");
+
+        if (result.HResult == NetworkUnreachable)
+        {
+            Console.Error.WriteLine("Check that Windows can reach Microsoft Store and Windows Update through any proxy or firewall.");
+            Console.Error.WriteLine("Run 'winget --info' to locate its diagnostic logs.");
+        }
     }
 
-    private static async Task<WingetResult?> HandleDisabledServices(string storeId, bool autoAccept)
+    private static async Task<WingetResult?> HandleDisabledServices(
+        string storeId, bool autoAccept, Func<string, bool, Task<WingetResult>> runWinget)
     {
         if (!IsAdmin())
         {
@@ -515,7 +531,7 @@ internal static partial class Program
             return null;
 
         Console.WriteLine("\nRetrying install...\n");
-        return await RunWinget(storeId, autoAccept);
+        return await runWinget(storeId, autoAccept);
     }
 
     private static readonly string[] StoreServices =
@@ -600,7 +616,7 @@ internal static partial class Program
 
     private readonly record struct CliOptions(string? Input, bool? AutoAccept, bool ShowHelp, string? Error);
 
-    private readonly record struct WingetResult(int ExitCode, string? LaunchError = null)
+    internal readonly record struct WingetResult(int ExitCode, string? LaunchError = null)
     {
         public uint HResult => unchecked((uint)ExitCode);
         public bool AlreadyInstalled => HResult is WingetUpdateNotApplicable
@@ -609,5 +625,5 @@ internal static partial class Program
         public bool ReachedDesiredState => ExitCode == 0 || AlreadyInstalled;
     }
 
-    private readonly record struct StoreInstallerResult(bool Success, string? Error);
+    internal readonly record struct StoreInstallerResult(bool Success, string? Error);
 }
