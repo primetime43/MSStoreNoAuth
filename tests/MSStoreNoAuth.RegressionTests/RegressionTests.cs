@@ -27,8 +27,8 @@ internal static class RegressionTests
 
     private static async Task RunTests()
     {
-        var installed = new Program.StoreInstallerResult(true, null);
-        var installerFailed = new Program.StoreInstallerResult(false, "Microsoft returned HTTP 503.");
+        var installed = new StoreInstallerResult(true, null);
+        var installerFailed = new StoreInstallerResult(false, "Microsoft returned HTTP 503.");
 
         await Verify("Auto mode uses the web installer after a network error",
             "--auto", [(true, NetworkUnreachable)], installed, 0,
@@ -65,7 +65,7 @@ internal static class RegressionTests
         string name,
         string mode,
         (bool AutoAccept, uint HResult)[] expectedAttempts,
-        Program.StoreInstallerResult? installerResult,
+        StoreInstallerResult? installerResult,
         int expectedExitCode,
         params string[] expectedMessages)
     {
@@ -85,7 +85,7 @@ internal static class RegressionTests
                 if (id != StoreId || !attempts.TryDequeue(out var attempt) || attempt.AutoAccept != autoAccept)
                     throw new InvalidOperationException($"{name}: unexpected WinGet call for {id} with auto-accept {autoAccept}.");
 
-                return Task.FromResult(new Program.WingetResult(unchecked((int)attempt.HResult)));
+                return Task.FromResult(new WingetResult(unchecked((int)attempt.HResult)));
             }, id =>
             {
                 if (id != StoreId || installerResult is null || ++webInstallerCalls != 1)

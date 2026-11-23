@@ -7,6 +7,6 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="../../MSStoreNoAuth/Program.cs" Link="Program.cs" />
+    <Compile Include="../../MSStoreNoAuth/*.cs" Link="%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>
