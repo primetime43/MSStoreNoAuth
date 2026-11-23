@@ -92,8 +92,8 @@ dotnet run --project tests/MSStoreNoAuth.RegressionTests --configuration Release
 Commit the desired release contents, create a version tag on that commit, and push the tag:
 
 ```powershell
-git tag v1.3
-git push origin v1.3
+git tag v1.4
+git push origin v1.4
 ```
 
 The GitHub Actions workflow builds a self-contained Windows x64 `.exe` and attaches it to a GitHub Release with generated release notes. Numeric tags such as `1.2` are also supported.

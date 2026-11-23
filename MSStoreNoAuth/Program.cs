@@ -2,7 +2,7 @@ using System.Text.RegularExpressions;
 
 internal static partial class Program
 {
-    internal const string Version = "v1.3";
+    internal const string Version = "v1.4";
 
     private static Task<int> Main(string[] args) => RunAsync(args, WingetInstaller.RunAsync, StoreWebInstaller.RunAsync);
 
